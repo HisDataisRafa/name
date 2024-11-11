@@ -2,9 +2,10 @@ import streamlit as st
 import librosa
 import soundfile as sf
 import numpy as np
-from pydub import AudioSegment
+import io
 import os
 import tempfile
+import scipy.io.wavfile
 
 st.set_page_config(page_title="Separador de Voces", layout="wide")
 
@@ -63,30 +64,22 @@ def process_audio(audio_file):
         status_text.text("Guardando archivos...")
         progress_bar.progress(80)
         
-        # Guardar WAVs temporales
-        male_wav = os.path.join(temp_dir, 'male.wav')
-        female_wav = os.path.join(temp_dir, 'female.wav')
+        # Convertir a WAV en memoria
+        male_buffer = io.BytesIO()
+        female_buffer = io.BytesIO()
         
-        sf.write(male_wav, male_voice, sr)
-        sf.write(female_wav, female_voice, sr)
+        # Normalizar y convertir a int16
+        male_voice_norm = np.int16(male_voice * 32767)
+        female_voice_norm = np.int16(female_voice * 32767)
         
-        # Convertir a MP3
-        male_mp3 = os.path.join(temp_dir, 'male.mp3')
-        female_mp3 = os.path.join(temp_dir, 'female.mp3')
-        
-        AudioSegment.from_wav(male_wav).export(male_mp3, format='mp3')
-        AudioSegment.from_wav(female_wav).export(female_mp3, format='mp3')
+        # Guardar como WAV
+        scipy.io.wavfile.write(male_buffer, sr, male_voice_norm)
+        scipy.io.wavfile.write(female_buffer, sr, female_voice_norm)
         
         progress_bar.progress(100)
         status_text.text("¡Proceso completado!")
         
-        # Leer archivos MP3 para descargar
-        with open(male_mp3, 'rb') as f:
-            male_data = f.read()
-        with open(female_mp3, 'rb') as f:
-            female_data = f.read()
-        
-        return male_data, female_data
+        return male_buffer.getvalue(), female_buffer.getvalue()
         
     finally:
         # Limpiar archivos temporales
@@ -121,17 +114,30 @@ if uploaded_file is not None:
                 st.download_button(
                     label="⬇️ Descargar Voz Masculina",
                     data=male_data,
-                    file_name="voz_masculina.mp3",
-                    mime="audio/mp3"
+                    file_name="voz_masculina.wav",
+                    mime="audio/wav"
                 )
             
             with col2:
                 st.download_button(
                     label="⬇️ Descargar Voz Femenina",
                     data=female_data,
-                    file_name="voz_femenina.mp3",
-                    mime="audio/mp3"
+                    file_name="voz_femenina.wav",
+                    mime="audio/wav"
                 )
+                
+            st.success("✅ Audio procesado correctamente! Los archivos están listos para descargar.")
                 
         except Exception as e:
             st.error(f"Error durante el procesamiento: {str(e)}")
+
+# Información adicional
+st.markdown("---")
+st.write("### Notas:")
+st.write("""
+- La separación se basa en el tono de voz (pitch)
+- Los silencios se mantienen para que los archivos permanezcan sincronizados
+- La calidad de la separación depende de la calidad del audio original
+- Los archivos se guardan en formato WAV para mantener la calidad
+- Si las voces se solapan, la separación puede no ser perfecta
+""")
