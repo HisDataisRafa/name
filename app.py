@@ -9,78 +9,115 @@ import scipy.io.wavfile
 
 st.set_page_config(page_title="Separador de Voces", layout="wide")
 
-st.title("🎤 Separador de Voces")
+st.title("🎤 Separador de Voces Mejorado")
 st.write("Esta aplicación separa voces masculinas y femeninas de un archivo de audio.")
 
-def process_audio(audio_file):
-    # Crear directorio temporal
-    temp_dir = tempfile.mkdtemp()
+def get_pitch_features(y, sr, frame_length=2048, hop_length=512):
+    # Obtener características más detalladas del pitch
+    pitches, magnitudes = librosa.piptrack(
+        y=y, 
+        sr=sr,
+        n_fft=frame_length,
+        hop_length=hop_length,
+        fmin=librosa.note_to_hz('C2'),
+        fmax=librosa.note_to_hz('C7')
+    )
     
+    # Obtener el pitch predominante en cada frame
+    pitch_mean = []
+    for i in range(magnitudes.shape[1]):
+        index = magnitudes[:, i].argmax()
+        pitch_mean.append(pitches[index, i])
+    
+    return np.array(pitch_mean)
+
+def smooth_array(arr, window_size=5):
+    # Suavizar las transiciones para evitar cortes bruscos
+    kernel = np.ones(window_size) / window_size
+    return np.convolve(arr, kernel, mode='same')
+
+def process_audio(audio_file, pitch_threshold, smoothing_window):
     try:
-        # Guardar el archivo subido temporalmente
+        # Crear directorio temporal
+        temp_dir = tempfile.mkdtemp()
         temp_input = os.path.join(temp_dir, "input.mp3")
+        
         with open(temp_input, "wb") as f:
             f.write(audio_file.getvalue())
         
-        # Barra de progreso
+        # Mostrar progreso
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         # Cargar audio
         status_text.text("Cargando audio...")
         progress_bar.progress(10)
+        
+        # Cargar con una duración máxima más larga
         y, sr = librosa.load(temp_input, sr=None)
         
-        # Detectar segmentos
+        # Normalizar audio
+        y = librosa.util.normalize(y)
+        
+        # Detectar segmentos de voz
         status_text.text("Detectando segmentos de voz...")
         progress_bar.progress(30)
-        intervals = librosa.effects.split(y, top_db=20)
         
-        # Preparar arrays
-        male_voice = np.zeros_like(y)
-        female_voice = np.zeros_like(y)
+        # Parámetros para el análisis
+        frame_length = 2048
+        hop_length = 512
         
-        # Procesar segmentos
+        # Obtener características del pitch
+        status_text.text("Analizando características de voz...")
+        pitch_mean = get_pitch_features(y, sr, frame_length, hop_length)
+        
+        # Crear máscaras para separación
+        time_steps = np.arange(len(pitch_mean)) * hop_length
+        mask_male = pitch_mean < pitch_threshold
+        mask_female = ~mask_male
+        
+        # Suavizar máscaras
+        mask_male = smooth_array(mask_male.astype(float), smoothing_window)
+        mask_female = smooth_array(mask_female.astype(float), smoothing_window)
+        
+        # Crear señales separadas
         status_text.text("Separando voces...")
-        total_intervals = len(intervals)
+        progress_bar.progress(60)
         
-        for i, (start, end) in enumerate(intervals):
-            segment = y[start:end]
-            pitches, magnitudes = librosa.piptrack(y=segment, sr=sr)
-            pit = pitches[magnitudes > 0.1]
-            if len(pit) > 0:
-                avg_pitch = np.mean(pit)
-                if avg_pitch < 185:
-                    male_voice[start:end] = segment
-                else:
-                    female_voice[start:end] = segment
-            
-            # Actualizar progreso
-            progress = 30 + (i / total_intervals * 40)
-            progress_bar.progress(int(progress))
-            status_text.text(f"Procesando segmento {i+1} de {total_intervals}")
+        # Convertir máscaras a longitud de señal
+        mask_male_full = np.repeat(mask_male, hop_length)[:len(y)]
+        mask_female_full = np.repeat(mask_female, hop_length)[:len(y)]
         
-        # Guardar archivos
+        # Aplicar máscaras con superposición suave
+        male_voice = y * mask_male_full
+        female_voice = y * mask_female_full
+        
+        # Normalizar resultados
+        male_voice = librosa.util.normalize(male_voice)
+        female_voice = librosa.util.normalize(female_voice)
+        
         status_text.text("Guardando archivos...")
-        progress_bar.progress(80)
+        progress_bar.progress(90)
         
-        # Convertir a WAV en memoria
+        # Convertir a int16 con normalización mejorada
+        male_voice_int = np.int16(male_voice * 32767)
+        female_voice_int = np.int16(female_voice * 32767)
+        
+        # Guardar en buffer
         male_buffer = io.BytesIO()
         female_buffer = io.BytesIO()
         
-        # Normalizar y convertir a int16
-        male_voice_norm = np.int16(male_voice * 32767)
-        female_voice_norm = np.int16(female_voice * 32767)
-        
-        # Guardar como WAV
-        scipy.io.wavfile.write(male_buffer, sr, male_voice_norm)
-        scipy.io.wavfile.write(female_buffer, sr, female_voice_norm)
+        scipy.io.wavfile.write(male_buffer, sr, male_voice_int)
+        scipy.io.wavfile.write(female_buffer, sr, female_voice_int)
         
         progress_bar.progress(100)
         status_text.text("¡Proceso completado!")
         
         return male_buffer.getvalue(), female_buffer.getvalue()
         
+    except Exception as e:
+        st.error(f"Error en el procesamiento: {str(e)}")
+        return None, None
     finally:
         # Limpiar archivos temporales
         for file in os.listdir(temp_dir):
@@ -93,21 +130,36 @@ def process_audio(audio_file):
         except:
             pass
 
-# Interfaz de usuario
-st.write("### Instrucciones:")
-st.write("1. Sube tu archivo MP3")
-st.write("2. Espera a que se procese")
-st.write("3. Descarga los archivos separados")
+# Interfaz de usuario con parámetros ajustables
+st.write("### Configuración:")
+col1, col2 = st.columns(2)
+
+with col1:
+    pitch_threshold = st.slider(
+        "Umbral de pitch (Hz)",
+        min_value=100,
+        max_value=300,
+        value=165,
+        help="Ajusta este valor para determinar el límite entre voz masculina y femenina"
+    )
+
+with col2:
+    smoothing_window = st.slider(
+        "Ventana de suavizado",
+        min_value=1,
+        max_value=21,
+        value=11,
+        step=2,
+        help="Un valor más alto hace las transiciones más suaves pero puede mezclar más las voces"
+    )
 
 uploaded_file = st.file_uploader("Escoge un archivo MP3", type=['mp3'])
 
 if uploaded_file is not None:
     if st.button("Separar Voces"):
-        try:
-            with st.spinner('Procesando...'):
-                male_data, female_data = process_audio(uploaded_file)
-            
-            # Botones de descarga
+        male_data, female_data = process_audio(uploaded_file, pitch_threshold, smoothing_window)
+        
+        if male_data and female_data:
             col1, col2 = st.columns(2)
             
             with col1:
@@ -125,19 +177,15 @@ if uploaded_file is not None:
                     file_name="voz_femenina.wav",
                     mime="audio/wav"
                 )
-                
-            st.success("✅ Audio procesado correctamente! Los archivos están listos para descargar.")
-                
-        except Exception as e:
-            st.error(f"Error durante el procesamiento: {str(e)}")
+            
+            st.success("✅ Audio procesado correctamente! Prueba ajustar los parámetros si la separación no es óptima.")
 
-# Información adicional
 st.markdown("---")
-st.write("### Notas:")
+st.write("### Consejos para mejor resultado:")
 st.write("""
-- La separación se basa en el tono de voz (pitch)
-- Los silencios se mantienen para que los archivos permanezcan sincronizados
-- La calidad de la separación depende de la calidad del audio original
-- Los archivos se guardan en formato WAV para mantener la calidad
-- Si las voces se solapan, la separación puede no ser perfecta
+- Ajusta el umbral de pitch según las voces específicas de tu audio
+- Si las voces se mezclan demasiado, reduce la ventana de suavizado
+- Si hay cortes bruscos, aumenta la ventana de suavizado
+- Prueba diferentes combinaciones de parámetros para encontrar el mejor resultado
+- La calidad de la separación depende mucho de la calidad del audio original
 """)
