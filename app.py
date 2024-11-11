@@ -6,14 +6,70 @@ import io
 import os
 import tempfile
 import scipy.io.wavfile
+from scipy.signal import find_peaks
+import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Separador de Voces", layout="wide")
+st.set_page_config(page_title="Separador de Voces Inteligente", layout="wide")
 
-st.title("🎤 Separador de Voces Mejorado")
-st.write("Esta aplicación separa voces masculinas y femeninas de un archivo de audio.")
+st.title("🎤 Separador de Voces con Detección Automática")
+st.write("Esta aplicación analiza y separa voces basándose en la detección automática de tonos dominantes.")
 
-def get_pitch_features(y, sr, frame_length=2048, hop_length=512):
-    # Obtener características más detalladas del pitch
+def analyze_pitch_distribution(y, sr, frame_length=2048, hop_length=512):
+    """Analiza la distribución de pitch en el audio y encuentra los picos dominantes"""
+    
+    # Obtener características detalladas del pitch
+    pitches, magnitudes = librosa.piptrack(
+        y=y, 
+        sr=sr,
+        n_fft=frame_length,
+        hop_length=hop_length,
+        fmin=librosa.note_to_hz('C2'),
+        fmax=librosa.note_to_hz('C7')
+    )
+    
+    # Obtener el pitch predominante en cada frame
+    pitch_values = []
+    for i in range(magnitudes.shape[1]):
+        index = magnitudes[:, i].argmax()
+        if magnitudes[index, i] > 0:  # Solo considerar frames con suficiente energía
+            pitch_values.append(pitches[index, i])
+    
+    pitch_values = np.array(pitch_values)
+    
+    # Crear histograma de pitch
+    hist, bins = np.histogram(pitch_values, bins=100, range=(50, 400))
+    
+    # Suavizar el histograma para encontrar picos más claros
+    hist_smooth = np.convolve(hist, np.hamming(10), mode='same')
+    
+    # Encontrar picos en el histograma suavizado
+    peaks, _ = find_peaks(hist_smooth, distance=20, prominence=max(hist_smooth)*0.1)
+    peak_frequencies = bins[peaks]
+    peak_magnitudes = hist_smooth[peaks]
+    
+    # Ordenar picos por magnitud
+    sorted_indices = np.argsort(peak_magnitudes)[::-1]
+    dominant_peaks = peak_frequencies[sorted_indices][:2]  # Tomar los 2 picos más fuertes
+    
+    # Visualizar la distribución
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(bins[:-1], hist_smooth, label='Distribución de pitch')
+    ax.plot(peak_frequencies, hist_smooth[peaks], "x", label='Picos detectados')
+    for peak in dominant_peaks:
+        ax.axvline(x=peak, color='r', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Frecuencia (Hz)')
+    ax.set_ylabel('Cantidad')
+    ax.set_title('Distribución de Pitch en el Audio')
+    ax.legend()
+    
+    return dominant_peaks, fig
+
+def separate_voice_by_pitch(y, sr, target_pitch, tolerance, smoothing_window):
+    """Separa una voz específica basada en el pitch objetivo"""
+    frame_length = 2048
+    hop_length = 512
+    
+    # Obtener características del pitch
     pitches, magnitudes = librosa.piptrack(
         y=y, 
         sr=sr,
@@ -29,14 +85,25 @@ def get_pitch_features(y, sr, frame_length=2048, hop_length=512):
         index = magnitudes[:, i].argmax()
         pitch_mean.append(pitches[index, i])
     
-    return np.array(pitch_mean)
+    pitch_mean = np.array(pitch_mean)
+    
+    # Crear máscara basada en el pitch objetivo y tolerancia
+    mask = np.abs(pitch_mean - target_pitch) <= tolerance
+    
+    # Suavizar máscara
+    mask_smooth = smooth_array(mask.astype(float), smoothing_window)
+    
+    # Aplicar máscara al audio
+    mask_full = np.repeat(mask_smooth, hop_length)[:len(y)]
+    voice_separated = y * mask_full
+    
+    return librosa.util.normalize(voice_separated)
 
 def smooth_array(arr, window_size=5):
-    # Suavizar las transiciones para evitar cortes bruscos
     kernel = np.ones(window_size) / window_size
-    return np.convolve(arr, kernel, mode='same')
+    return np.convolve(arr, mode='same', a=arr, v=kernel)
 
-def process_audio(audio_file, pitch_threshold, smoothing_window):
+def process_audio(audio_file, target_pitch, tolerance, smoothing_window):
     try:
         # Crear directorio temporal
         temp_dir = tempfile.mkdtemp()
@@ -45,79 +112,36 @@ def process_audio(audio_file, pitch_threshold, smoothing_window):
         with open(temp_input, "wb") as f:
             f.write(audio_file.getvalue())
         
-        # Mostrar progreso
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         # Cargar audio
         status_text.text("Cargando audio...")
         progress_bar.progress(10)
-        
-        # Cargar con una duración máxima más larga
         y, sr = librosa.load(temp_input, sr=None)
-        
-        # Normalizar audio
         y = librosa.util.normalize(y)
         
-        # Detectar segmentos de voz
-        status_text.text("Detectando segmentos de voz...")
-        progress_bar.progress(30)
+        # Separar la voz específica
+        status_text.text("Separando voz...")
+        progress_bar.progress(50)
         
-        # Parámetros para el análisis
-        frame_length = 2048
-        hop_length = 512
+        separated_voice = separate_voice_by_pitch(y, sr, target_pitch, tolerance, smoothing_window)
         
-        # Obtener características del pitch
-        status_text.text("Analizando características de voz...")
-        pitch_mean = get_pitch_features(y, sr, frame_length, hop_length)
-        
-        # Crear máscaras para separación
-        time_steps = np.arange(len(pitch_mean)) * hop_length
-        mask_male = pitch_mean < pitch_threshold
-        mask_female = ~mask_male
-        
-        # Suavizar máscaras
-        mask_male = smooth_array(mask_male.astype(float), smoothing_window)
-        mask_female = smooth_array(mask_female.astype(float), smoothing_window)
-        
-        # Crear señales separadas
-        status_text.text("Separando voces...")
-        progress_bar.progress(60)
-        
-        # Convertir máscaras a longitud de señal
-        mask_male_full = np.repeat(mask_male, hop_length)[:len(y)]
-        mask_female_full = np.repeat(mask_female, hop_length)[:len(y)]
-        
-        # Aplicar máscaras con superposición suave
-        male_voice = y * mask_male_full
-        female_voice = y * mask_female_full
-        
-        # Normalizar resultados
-        male_voice = librosa.util.normalize(male_voice)
-        female_voice = librosa.util.normalize(female_voice)
-        
-        status_text.text("Guardando archivos...")
-        progress_bar.progress(90)
-        
-        # Convertir a int16 con normalización mejorada
-        male_voice_int = np.int16(male_voice * 32767)
-        female_voice_int = np.int16(female_voice * 32767)
+        # Convertir a int16
+        voice_int = np.int16(separated_voice * 32767)
         
         # Guardar en buffer
-        male_buffer = io.BytesIO()
-        female_buffer = io.BytesIO()
-        
-        scipy.io.wavfile.write(male_buffer, sr, male_voice_int)
-        scipy.io.wavfile.write(female_buffer, sr, female_voice_int)
+        voice_buffer = io.BytesIO()
+        scipy.io.wavfile.write(voice_buffer, sr, voice_int)
         
         progress_bar.progress(100)
         status_text.text("¡Proceso completado!")
         
-        return male_buffer.getvalue(), female_buffer.getvalue()
+        return voice_buffer.getvalue()
         
     except Exception as e:
         st.error(f"Error en el procesamiento: {str(e)}")
-        return None, None
+        return None
     finally:
         # Limpiar archivos temporales
         for file in os.listdir(temp_dir):
@@ -130,62 +154,88 @@ def process_audio(audio_file, pitch_threshold, smoothing_window):
         except:
             pass
 
-# Interfaz de usuario con parámetros ajustables
-st.write("### Configuración:")
-col1, col2 = st.columns(2)
-
-with col1:
-    pitch_threshold = st.slider(
-        "Umbral de pitch (Hz)",
-        min_value=100,
-        max_value=300,
-        value=165,
-        help="Ajusta este valor para determinar el límite entre voz masculina y femenina"
-    )
-
-with col2:
-    smoothing_window = st.slider(
-        "Ventana de suavizado",
-        min_value=1,
-        max_value=21,
-        value=11,
-        step=2,
-        help="Un valor más alto hace las transiciones más suaves pero puede mezclar más las voces"
-    )
-
+# Interfaz de usuario
 uploaded_file = st.file_uploader("Escoge un archivo MP3", type=['mp3'])
 
 if uploaded_file is not None:
-    if st.button("Separar Voces"):
-        male_data, female_data = process_audio(uploaded_file, pitch_threshold, smoothing_window)
+    # Botón para análisis inicial
+    if st.button("Analizar Voces"):
+        with st.spinner("Analizando distribución de pitch..."):
+            # Cargar audio para análisis
+            temp_dir = tempfile.mkdtemp()
+            temp_input = os.path.join(temp_dir, "input.mp3")
+            
+            with open(temp_input, "wb") as f:
+                f.write(uploaded_file.getvalue())
+            
+            y, sr = librosa.load(temp_input, sr=None)
+            
+            # Analizar distribución de pitch
+            dominant_pitches, fig = analyze_pitch_distribution(y, sr)
+            
+            # Mostrar resultados
+            st.write("### Pitches Dominantes Detectados:")
+            for i, pitch in enumerate(dominant_pitches, 1):
+                st.write(f"Pitch {i}: {pitch:.1f} Hz")
+            
+            # Mostrar gráfica
+            st.pyplot(fig)
+            
+            # Guardar pitches en session state
+            st.session_state['dominant_pitches'] = dominant_pitches
+    
+    # Parámetros para la separación
+    if 'dominant_pitches' in st.session_state:
+        st.write("### Configuración de Separación:")
         
-        if male_data and female_data:
-            col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            target_pitch = st.selectbox(
+                "Pitch Objetivo (Hz)",
+                options=st.session_state['dominant_pitches'],
+                format_func=lambda x: f"{x:.1f} Hz"
+            )
+        
+        with col2:
+            tolerance = st.slider(
+                "Tolerancia de Pitch (Hz)",
+                min_value=10,
+                max_value=50,
+                value=30,
+                help="Rango de frecuencias alrededor del pitch objetivo"
+            )
+        
+        with col3:
+            smoothing_window = st.slider(
+                "Ventana de Suavizado",
+                min_value=1,
+                max_value=21,
+                value=11,
+                step=2
+            )
+        
+        if st.button("Separar Voz"):
+            separated_voice = process_audio(uploaded_file, target_pitch, tolerance, smoothing_window)
             
-            with col1:
+            if separated_voice:
                 st.download_button(
-                    label="⬇️ Descargar Voz Masculina",
-                    data=male_data,
-                    file_name="voz_masculina.wav",
+                    label=f"⬇️ Descargar Voz ({target_pitch:.1f} Hz)",
+                    data=separated_voice,
+                    file_name=f"voz_{target_pitch:.1f}hz.wav",
                     mime="audio/wav"
                 )
-            
-            with col2:
-                st.download_button(
-                    label="⬇️ Descargar Voz Femenina",
-                    data=female_data,
-                    file_name="voz_femenina.wav",
-                    mime="audio/wav"
-                )
-            
-            st.success("✅ Audio procesado correctamente! Prueba ajustar los parámetros si la separación no es óptima.")
+                
+                st.success("✅ Voz separada correctamente!")
 
 st.markdown("---")
-st.write("### Consejos para mejor resultado:")
+st.write("### Cómo funciona:")
 st.write("""
-- Ajusta el umbral de pitch según las voces específicas de tu audio
-- Si las voces se mezclan demasiado, reduce la ventana de suavizado
-- Si hay cortes bruscos, aumenta la ventana de suavizado
-- Prueba diferentes combinaciones de parámetros para encontrar el mejor resultado
-- La calidad de la separación depende mucho de la calidad del audio original
+1. **Análisis Inicial**: El botón "Analizar Voces" examina el audio y detecta los pitches dominantes.
+2. **Visualización**: Muestra un gráfico de la distribución de pitch y marca los picos detectados.
+3. **Separación**: Puedes seleccionar uno de los pitches detectados y ajustar la tolerancia y suavizado.
+4. **Ajuste Fino**: 
+   - Aumenta la tolerancia si la voz suena entrecortada
+   - Reduce la tolerancia si se filtran otras voces
+   - Ajusta el suavizado para mejorar las transiciones
 """)
