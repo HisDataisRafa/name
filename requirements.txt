@@ -2,4 +2,4 @@ streamlit
 librosa
 soundfile
 numpy
-pydub
+scipy
